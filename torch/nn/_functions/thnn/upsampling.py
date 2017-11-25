@@ -1,10 +1,12 @@
 from numbers import Integral
 import torch
-from torch.autograd.function import Function, once_differentiable
+from torch.autograd.function import Function
 from torch._thnn import type2backend
 
 from . import _all_functions
-from ...modules.utils import _pair, _triple
+from ...modules.utils import _single, _pair, _triple
+
+import warnings
 
 
 def _check_size_scale_factor(size, scale_factor):
@@ -14,7 +16,167 @@ def _check_size_scale_factor(size, scale_factor):
         raise ValueError('scale_factor must be of integer type or a tuple of integer types')
 
 
+def _check_linear_scale_factor(scale_factor, dim=2):
+    if dim == 1:
+        scale_factor = _single(scale_factor)
+    elif dim == 2:
+        scale_factor = _pair(scale_factor)
+    elif dim == 3:
+        scale_factor = _triple(scale_factor)
+    else:
+        raise ValueError("dim has to be 1, 2 or 3")
+
+    try:
+        assert len(scale_factor) == 1 or len(scale_factor) == 2 or len(scale_factor) == 3
+        assert all(isinstance(s, Integral) and s >= 1 for s in scale_factor)
+    except AssertionError as e:
+        raise ValueError('scale_factor must be a non-negative integer, '
+                         'or a tuple of non-negative integers for linear, bilinear and trilinear upsampling, but got: '
+                         '{}'.format(scale_factor))
+    return scale_factor
+
+
+class UpsamplingNearest1d(Function):
+
+    @staticmethod
+    def forward(ctx, input, size=None, scale_factor=None):
+        assert input.dim() == 3
+
+        _check_size_scale_factor(size, scale_factor)
+
+        ctx.size = size
+        ctx.scale_factor = scale_factor
+
+        if ctx.scale_factor is not None and not isinstance(ctx.scale_factor, Integral):
+            raise ValueError('scale_factor must be a single Integer value for nearest neighbor sampling')
+
+        if ctx.scale_factor is None:
+            if (ctx.size[0] % input.size(2) != 0):
+                raise RuntimeError("output size specified in UpsamplingNearest "
+                                   "({}) has to be divisible by the input size, but got: "
+                                   "{}".format('x'.join(map(str, ctx.size)),
+                                               'x'.join(map(str, input.size()))))
+            ctx.scale_factor = ctx.size[0] // input.size(2)
+
+        output = input.new()
+        backend = type2backend[type(input)]
+        ctx.save_for_backward(input)
+        backend.TemporalUpSamplingNearest_updateOutput(
+            backend.library_state,
+            input,
+            output,
+            ctx.scale_factor
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_variables
+        grad_input = UpsamplingNearest1dBackward.apply(input, grad_output, ctx.scale_factor)
+        return grad_input, None, None
+
+
+class UpsamplingNearest1dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, input, grad_output, scale_factor):
+        assert grad_output.dim() == 3
+        ctx.scale_factor = scale_factor
+
+        grad_input = grad_output.new()
+        backend = type2backend[type(input)]
+        backend.TemporalUpSamplingNearest_updateGradInput(
+            backend.library_state,
+            input,
+            grad_output,
+            grad_input,
+            ctx.scale_factor
+        )
+        return grad_input
+
+    @staticmethod
+    def backward(ctx, ggI):
+        gI = None
+        ggO = UpsamplingNearest1d.apply(ggI, None, ctx.scale_factor)
+
+        return gI, ggO, None
+
+
+class UpsamplingLinear1d(Function):
+
+    @staticmethod
+    def forward(ctx, input, size=None, scale_factor=None):
+        assert input.dim() == 3
+
+        ctx.size = size
+        ctx.scale_factor = scale_factor
+
+        if ctx.scale_factor is not None:
+            ctx.scale_factor = _check_linear_scale_factor(ctx.scale_factor, dim=1)
+
+        if ctx.scale_factor is not None:
+            ctx.output_size = (
+                input.size(2) * ctx.scale_factor[0],
+            )
+        else:
+            ctx.output_size = ctx.size
+
+        ctx.input_size = input.size()
+        output = input.new()
+        backend = type2backend[type(input)]
+        backend.TemporalUpSamplingLinear_updateOutput(
+            backend.library_state,
+            input,
+            output,
+            ctx.output_size[0]
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = UpsamplingLinear1dBackward.apply(grad_output, ctx.input_size, ctx.output_size)
+        return grad_input, None, None
+
+
+class UpsamplingLinear1dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, grad_output, input_size, output_size):
+        assert grad_output.dim() == 3
+
+        ctx.input_size = input_size
+        ctx.output_size = output_size
+
+        grad_output = grad_output.contiguous()
+        grad_input = grad_output.new()
+        backend = type2backend[type(grad_output)]
+        backend.TemporalUpSamplingLinear_updateGradInput(
+            backend.library_state,
+            grad_output,
+            grad_input,
+            ctx.input_size[0],
+            ctx.input_size[1],
+            ctx.input_size[2],
+            ctx.output_size[0],
+        )
+        return grad_input
+
+    @staticmethod
+    def backward(ctx, ggI):
+        ggO = UpsamplingLinear1d.apply(ggI, ctx.output_size, None)
+
+        return ggO, None, None
+
+
 class UpsamplingNearest2d(Function):
+
+    @staticmethod
+    def symbolic(g, input, size=None, scale_factor=None):
+        if scale_factor is None:
+            scale_factor = 1.0
+        if size is not None and set(size) != set([None]):
+            warnings.warn("ONNX export failed on UpsamplingNearest2d because size is not supported")
+        return g.op("ResizeNearest", input, width_scale_f=scale_factor, height_scale_f=scale_factor)
 
     @staticmethod
     def forward(ctx, input, size=None, scale_factor=None):
@@ -52,11 +214,19 @@ class UpsamplingNearest2d(Function):
         return output
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
-        assert grad_output.dim() == 4
+        input, = ctx.saved_variables
+        grad_input = UpsamplingNearest2dBackward.apply(input, grad_output, ctx.scale_factor)
+        return grad_input, None, None
 
-        input, = ctx.saved_tensors
+
+class UpsamplingNearest2dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, input, grad_output, scale_factor):
+        assert grad_output.dim() == 4
+        ctx.scale_factor = scale_factor
+
         grad_input = grad_output.new()
         backend = type2backend[type(input)]
         backend.SpatialUpSamplingNearest_updateGradInput(
@@ -66,25 +236,14 @@ class UpsamplingNearest2d(Function):
             grad_input,
             ctx.scale_factor
         )
-        return grad_input, None, None
+        return grad_input
 
+    @staticmethod
+    def backward(ctx, ggI):
+        gI = None
+        ggO = UpsamplingNearest2d.apply(ggI, None, ctx.scale_factor)
 
-def _check_linear_scale_factor(scale_factor, dim=2):
-    if dim == 2:
-        scale_factor = _pair(scale_factor)
-    elif dim == 3:
-        scale_factor = _triple(scale_factor)
-    else:
-        raise ValueError("dim has to be 2 or 3")
-
-    try:
-        assert len(scale_factor) == 2 or len(scale_factor) == 3
-        assert all(isinstance(s, Integral) and s >= 1 for s in scale_factor)
-    except AssertionError as e:
-        raise ValueError('scale_factor must be a non-negative integer, '
-                         'or a tuple of non-negative integers for bilinear and trilinear upsampling, but got: '
-                         '{}'.format(scale_factor))
-    return scale_factor
+        return gI, ggO, None
 
 
 class UpsamplingBilinear2d(Function):
@@ -120,9 +279,19 @@ class UpsamplingBilinear2d(Function):
         return output
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
+        grad_input = UpsamplingBilinear2dBackward.apply(grad_output, ctx.input_size, ctx.output_size)
+        return grad_input, None, None
+
+
+class UpsamplingBilinear2dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, grad_output, input_size, output_size):
         assert grad_output.dim() == 4
+
+        ctx.input_size = input_size
+        ctx.output_size = output_size
 
         grad_output = grad_output.contiguous()
         grad_input = grad_output.new()
@@ -138,7 +307,13 @@ class UpsamplingBilinear2d(Function):
             ctx.output_size[0],
             ctx.output_size[1],
         )
-        return grad_input, None, None
+        return grad_input
+
+    @staticmethod
+    def backward(ctx, ggI):
+        ggO = UpsamplingBilinear2d.apply(ggI, ctx.output_size, None)
+
+        return ggO, None, None
 
 
 class UpsamplingNearest3d(Function):
@@ -176,10 +351,20 @@ class UpsamplingNearest3d(Function):
         return output
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
+        input, = ctx.saved_variables
+
+        grad_input = UpsamplingNearest3dBackward.apply(input, grad_output, ctx.scale_factor)
+        return grad_input, None, None
+
+
+class UpsamplingNearest3dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, input, grad_output, scale_factor):
         assert grad_output.dim() == 5
-        input, = ctx.saved_tensors
+
+        ctx.scale_factor = scale_factor
         grad_input = grad_output.new()
         backend = type2backend[type(input)]
         backend.VolumetricUpSamplingNearest_updateGradInput(backend.library_state,
@@ -187,7 +372,14 @@ class UpsamplingNearest3d(Function):
                                                             grad_output,
                                                             grad_input,
                                                             ctx.scale_factor)
-        return grad_input, None, None
+        return grad_input
+
+    @staticmethod
+    def backward(ctx, ggI):
+        gI = None
+        ggO = UpsamplingNearest3d.apply(ggI, None, ctx.scale_factor)
+
+        return gI, ggO, None
 
 
 class UpsamplingTrilinear3d(Function):
@@ -225,10 +417,19 @@ class UpsamplingTrilinear3d(Function):
         return output
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
+        grad_input = UpsamplingTrilinear3dBackward.apply(grad_output, ctx.input_size, ctx.output_size)
+        return grad_input, None, None
+
+
+class UpsamplingTrilinear3dBackward(Function):
+
+    @staticmethod
+    def forward(ctx, grad_output, input_size, output_size):
         assert grad_output.dim() == 5
 
+        ctx.input_size = input_size
+        ctx.output_size = output_size
         grad_output = grad_output.contiguous()
         grad_input = grad_output.new()
         backend = type2backend[type(grad_output)]
@@ -245,10 +446,24 @@ class UpsamplingTrilinear3d(Function):
             ctx.output_size[1],
             ctx.output_size[2]
         )
-        return grad_input, None, None
+        return grad_input
+
+    @staticmethod
+    def backward(ctx, ggI):
+        ggO = UpsamplingTrilinear3d.apply(ggI, ctx.output_size, None)
+
+        return ggO, None, None
 
 
+_all_functions.append(UpsamplingNearest1d)
+_all_functions.append(UpsamplingNearest1dBackward)
+_all_functions.append(UpsamplingLinear1d)
+_all_functions.append(UpsamplingLinear1dBackward)
 _all_functions.append(UpsamplingNearest2d)
+_all_functions.append(UpsamplingNearest2dBackward)
 _all_functions.append(UpsamplingBilinear2d)
+_all_functions.append(UpsamplingBilinear2dBackward)
 _all_functions.append(UpsamplingNearest3d)
+_all_functions.append(UpsamplingNearest3dBackward)
 _all_functions.append(UpsamplingTrilinear3d)
+_all_functions.append(UpsamplingTrilinear3dBackward)

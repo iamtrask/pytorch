@@ -1,10 +1,11 @@
 import sys
 import math
 import threading
+import copy
 
 import torch
 from torch.autograd import Variable
-from torch._utils import _flatten_tensors, _unflatten_tensors
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.cuda.comm import broadcast_coalesced
 from torch.cuda import nccl
 import torch.distributed as dist
@@ -21,7 +22,7 @@ else:
 
 
 class DistributedDataParallel(Module):
-    """Implements distributed data parallelism at the module level.
+    r"""Implements distributed data parallelism at the module level.
 
     This container parallelizes the application of the given module by
     splitting the input across the specified devices by chunking in the batch
@@ -33,8 +34,8 @@ class DistributedDataParallel(Module):
     should also be an integer multiple of the number of GPUs so that each chunk
     is the same size (so that each GPU processes the same number of samples).
 
-    See also: :ref:`cuda-nn-dataparallel-instead`. The same constraints on input
-    as in :class:`torch.nn.DataParallel` apply.
+    See also: :ref:`distributed-basics` and :ref:`cuda-nn-dataparallel-instead`.
+    The same constraints on input as in :class:`torch.nn.DataParallel` apply.
 
     Creation of this class requires the distributed package to be already
     initialized in the process group mode
@@ -53,6 +54,9 @@ class DistributedDataParallel(Module):
         This module assumes all parameters are registered in the model by the
         time it is created. No parameters should be added nor removed later.
         Same applies to buffers.
+
+    .. warning::
+        This module assumes all buffers and gradients are dense.
 
     .. warning::
         This module doesn't work with :func:`torch.autograd.grad` (i.e. it will
@@ -95,7 +99,7 @@ class DistributedDataParallel(Module):
 
         if len(device_ids) > 1:
             # TODO: we don't need to replicate params in here. they're always going to
-            # be broadcasted using larger blocks in broadcast_coalesce, so it might be
+            # be broadcasted using larger blocks in broadcast_coalesced, so it might be
             # better to not pollute the caches with these small blocks
             self._module_copies = replicate(self.module, self.device_ids)
             self._module_copies[0] = self.module
@@ -143,6 +147,7 @@ class DistributedDataParallel(Module):
         attrs = copy.copy(self.__dict__)
         del attrs['_grad_accs'], attrs['_reduction_queues'], attrs['_reduction_streams'], \
             attrs['_reduction_threads'], attrs['_nccl_streams'], attrs['_default_streams']
+        return attrs
 
     def __setstate__(self, state):
         super(DistributedDataParallel, self).__setstate__(state)
@@ -150,10 +155,10 @@ class DistributedDataParallel(Module):
         self._start_reduction_threads()
 
     def forward(self, *inputs, **kwargs):
-        if len(self.device_ids) == 1:
-            return self.module(*inputs, **kwargs)
         inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
         self._sync_params()
+        if len(self.device_ids) == 1:
+            return self.module(*inputs[0], **kwargs[0])
         outputs = self.parallel_apply(self._module_copies, inputs, kwargs)
         return self.gather(outputs, self.output_device)
 
@@ -178,18 +183,19 @@ class DistributedDataParallel(Module):
             for tensor, param in zip(tensors, module.parameters()):
                 param.data.set_(tensor)
 
-        # cross-node buffer sync
         buffers = list(self.module._all_buffers())
-        flat_buffers = _flatten_tensors(buffers)
-        dist.broadcast(flat_buffers, 0)
-        for buf, synced in zip(buffers, _unflatten_tensors(flat_buffers, buffers)):
-            buf.copy_(synced)
+        if len(buffers) > 0:
+            # cross-node buffer sync
+            flat_buffers = _flatten_dense_tensors(buffers)
+            dist.broadcast(flat_buffers, 0)
+            for buf, synced in zip(buffers, _unflatten_dense_tensors(flat_buffers, buffers)):
+                buf.copy_(synced)
 
-        # intra-node buffer sync
-        result = broadcast_coalesced(buffers, self.device_ids, self.broadcast_bucket_size)
-        for tensors, module in zip(result[1:], self._module_copies[1:]):
-            for tensor, buf in zip(tensors, module._all_buffers()):
-                buf.set_(tensor)
+            # intra-node buffer sync
+            result = broadcast_coalesced(buffers, self.device_ids, self.broadcast_bucket_size)
+            for tensors, module in zip(result[1:], self._module_copies[1:]):
+                for tensor, buf in zip(tensors, module._all_buffers()):
+                    buf.set_(tensor)
 
     def _register_grad_hooks(self):
         self._grad_accs = []  # need to keep them in scope
@@ -279,6 +285,7 @@ class DistributedDataParallel(Module):
             self._reduction_threads.append(threading.Thread(
                 target=self._reduction_thread_fn,
                 args=(reduction_queue, group_id, self.device_ids, reduction_streams, self._nccl_streams)))
+            self._reduction_threads[-1].daemon = True
             self._reduction_threads[-1].start()
 
     @staticmethod
@@ -291,12 +298,12 @@ class DistributedDataParallel(Module):
             for dev_id, grad_batch, event, stream in zip(device_ids, dev_grad_batch, dev_events, reduction_streams):
                 with torch.cuda.device(dev_id), torch.cuda.stream(stream):
                     stream.wait_event(event)
-                    coalesced = _flatten_tensors(grad_batch)
+                    coalesced = _flatten_dense_tensors(grad_batch)
                     dev_coalesced.append(coalesced)
             # Wait for all copies to complete before starting the NCCL kernel
             for stream in reduction_streams:
                 stream.synchronize()
-            nccl.reduce(dev_coalesced, root=device_ids[0], streams=nccl_streams)
+            nccl.reduce(dev_coalesced, root=0, streams=nccl_streams)
 
             # From now on we're only going to work on the first device (from device_ids)
             grad_batch = dev_grad_batch[0]
@@ -306,7 +313,7 @@ class DistributedDataParallel(Module):
                 reduce_stream.wait_stream(nccl_streams[0])
                 coalesced /= dist.get_world_size()
                 dist.all_reduce(coalesced, group=group_id)
-                for grad, reduced in zip(grad_batch, _unflatten_tensors(coalesced, grad_batch)):
+                for grad, reduced in zip(grad_batch, _unflatten_dense_tensors(coalesced, grad_batch)):
                     grad.copy_(reduced)
             job_event.set()
 
